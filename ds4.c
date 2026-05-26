@@ -5812,6 +5812,8 @@ typedef struct {
     uint64_t out_dim;
     uint64_t row_bytes[DS4_MAX_EXPERT];
     uint64_t midq_blocks;
+    int expert_start;   /* distributed: first owned expert */
+    int expert_end;     /* distributed: one-past-last owned expert */
 } matvec_q2_k_batch_accum_rows_ctx;
 
 static void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
@@ -5824,6 +5826,9 @@ static void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint6
 
         for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
             const uint32_t expert = ctx->active_expert[ai];
+            /* In distributed mode, skip experts not owned by this rank. */
+            if ((int)expert < ctx->expert_start || (int)expert >= ctx->expert_end)
+                continue;
             const uint32_t begin = ctx->expert_offset[expert];
             const uint32_t end = ctx->expert_offset[expert + 1];
             const block_q2_K *br = (const block_q2_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
@@ -7696,6 +7701,14 @@ static void layer_routed_moe_batch(
     } else {
         ds4_die("unsupported down expert tensor type for batch");
     }
+
+#ifdef DS4_JACCL
+    if (g_jaccl_group) {
+        jaccl_group_all_sum(g_jaccl_group, moe, moe,
+                            (size_t)n_tok * DS4_N_EMBD * sizeof(float),
+                            JACCL_FLOAT32);
+    }
+#endif
 
     free(midq);
     free(pair_ids);
