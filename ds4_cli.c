@@ -1543,6 +1543,10 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
 #endif
+#ifdef DS4_JACCL
+        } else if (!strcmp(arg, "--jaccl-distributed")) {
+            c.engine.jaccl_distributed = true;
+#endif
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {

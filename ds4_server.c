@@ -11550,6 +11550,10 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
+#ifdef DS4_JACCL
+        } else if (!strcmp(arg, "--jaccl-distributed")) {
+            c.engine.jaccl_distributed = true;
+#endif
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr, NULL);
