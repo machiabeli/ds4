@@ -118,6 +118,9 @@ typedef struct {
     uint32_t load_layer_end;
     bool load_output;
     ds4_distributed_options distributed;
+#ifdef DS4_JACCL
+    bool jaccl_distributed;
+#endif
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
