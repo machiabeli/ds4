@@ -15231,6 +15231,15 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
+#ifdef DS4_JACCL
+    if (ok && g_jaccl_group) {
+        /* Fused MoE kernel is synchronous (calls ds4_gpu_finish_command_buffer).
+         * routed_out is StorageModeShared -- CPU-readable, RDMA-registerable. */
+        void *buf = ds4_gpu_tensor_contents(g->routed_out);
+        jaccl_group_all_sum(g_jaccl_group, buf, buf,
+                            DS4_N_EMBD * sizeof(float), JACCL_FLOAT32);
+    }
+#endif
     if (ok && fuse_shared_gate_up) {
         ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
                                                          g->shared_up,
