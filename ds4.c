@@ -15206,8 +15206,14 @@ static bool metal_graph_encode_decode_layer(
         return ok;
     }
 #ifdef DS4_JACCL
-    if (ok && g_jaccl_group)
+    if (ok && g_jaccl_group) {
+        /* Commit and wait for the router select kernel before CPU reads
+         * router_selected/router_weights. Then restart the command batch
+         * for the fused MoE kernel that follows. */
+        ok = ds4_gpu_end_commands() != 0;
         metal_graph_mask_non_owned_experts(g, g_expert_start, g_expert_end, DS4_N_EXPERT_USED);
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+    }
 #endif
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
