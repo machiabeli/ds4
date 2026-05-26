@@ -18190,6 +18190,11 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
+#ifdef DS4_JACCL
+    if (ok && g_jaccl_group)
+        metal_graph_mask_non_owned_experts_batch(g, g_expert_start, g_expert_end,
+                                                 DS4_N_EXPERT_USED, n_tokens);
+#endif
 
     const bool selected_readahead_shared =
         metal_graph_stream_prefill_selected_readahead_shared_enabled(g);
@@ -18393,6 +18398,16 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
+#ifdef DS4_JACCL
+    if (ok && g_jaccl_group) {
+        /* Batch fused MoE kernel is synchronous. batch_routed_out is
+         * StorageModeShared -- CPU-readable, RDMA-registerable. */
+        void *buf = ds4_gpu_tensor_contents(g->batch_routed_out);
+        jaccl_group_all_sum(g_jaccl_group, buf, buf,
+                            (size_t)n_tokens * DS4_N_EMBD * sizeof(float),
+                            JACCL_FLOAT32);
+    }
+#endif
     if (!shared_done) {
         DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
     }
