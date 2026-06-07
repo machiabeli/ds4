@@ -139,6 +139,7 @@ static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
 static id<MTLComputePipelineState> g_expert_mask_pipeline;
 static id<MTLComputePipelineState> g_expert_mask_batch_pipeline;
+static id<MTLComputePipelineState> g_expert_compact_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
 static NSMutableDictionary<NSString *, DS4MetalQ4ExpertTable *> *g_q4_expert_table_cache;
@@ -5926,6 +5927,7 @@ int ds4_gpu_init(void) {
         /* Expert mask kernels — non-fatal, only needed for distributed JACCL. */
         g_expert_mask_pipeline = ds4_gpu_get_pipeline("kernel_expert_mask");
         g_expert_mask_batch_pipeline = ds4_gpu_get_pipeline("kernel_expert_mask_batch");
+        g_expert_compact_pipeline = ds4_gpu_get_pipeline("kernel_expert_compact");
         if (!g_expert_mask_pipeline || !g_expert_mask_batch_pipeline)
             fprintf(stderr, "ds4: Metal expert_mask kernel(s) not found (distributed masking unavailable)\n");
 
@@ -6482,6 +6484,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_hc_expand4_pipeline = nil;
         g_expert_mask_pipeline = nil;
         g_expert_mask_batch_pipeline = nil;
+        g_expert_compact_pipeline = nil;
         g_flash_attn_mask_buffer = nil;
         g_flash_attn_pad_buffer = nil;
         g_flash_attn_tmp_buffer = nil;
@@ -22125,6 +22128,21 @@ int ds4_gpu_routed_moe_one_tensor(
         const NSUInteger gate_smem = ds4_gpu_routed_mv_smem(gate_type);
         const NSUInteger down_smem = ds4_gpu_routed_mv_smem(down_type);
         int ok = 1;
+#ifdef DS4_JACCL
+        if (g_jaccl_group) {
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "pre_moe_mid_zero")) return 0;
+            int blit_owned = 0;
+            id<MTLCommandBuffer> blit_cb = ds4_gpu_command_buffer(&blit_owned);
+            if (!blit_cb) return 0;
+            id<MTLBlitCommandEncoder> blit = [blit_cb blitCommandEncoder];
+            [blit fillBuffer:midbuf range:NSMakeRange(ds4_gpu_tensor_offset(mid), mid_bytes) value:0];
+            [blit endEncoding];
+            if (!ds4_gpu_finish_command_buffer(blit_cb, blit_owned, "mid_zero")) return 0;
+            owned = 0;
+            cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+        }
+#endif
         const bool write_clamped_moe =
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL;
         id<MTLComputePipelineState> pair_swiglu_pipeline = nil;
@@ -24800,6 +24818,21 @@ int ds4_gpu_routed_moe_batch_tensor(
             n_tokens <= 4u &&
             down_sum6_pipeline != nil;
         int ok = 0;
+#ifdef DS4_JACCL
+        if (g_jaccl_group) {
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "pre_batch_mid_zero")) return 0;
+            int blit_owned = 0;
+            id<MTLCommandBuffer> blit_cb = ds4_gpu_command_buffer(&blit_owned);
+            if (!blit_cb) return 0;
+            id<MTLBlitCommandEncoder> blit = [blit_cb blitCommandEncoder];
+            [blit fillBuffer:midbuf range:NSMakeRange(ds4_gpu_tensor_offset(mid), mid_bytes) value:0];
+            [blit endEncoding];
+            if (!ds4_gpu_finish_command_buffer(blit_cb, blit_owned, "batch_mid_zero")) return 0;
+            owned = 0;
+            cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+        }
+#endif
         if (use_iq2_batch_selected_addr) {
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
                 .width = expert_mid_dim,
@@ -26472,6 +26505,41 @@ int ds4_gpu_expert_mask_batch(const ds4_gpu_tensor *selected, ds4_gpu_tensor *we
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "expert_mask_batch")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_expert_compact(const ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                           int32_t expert_start, int32_t expert_end,
+                           uint32_t n_expert_used, uint32_t *compacted_count) {
+    if (!g_expert_compact_pipeline || !selected || !weights || n_expert_used == 0 || !compacted_count) return 0;
+
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLBuffer> count_buf = ds4_gpu_new_transient_buffer(sizeof(uint32_t), "expert_compact_count");
+        if (!count_buf) return 0;
+
+        struct { int32_t expert_start; int32_t expert_end; uint32_t n_expert_used; } args = {
+            expert_start, expert_end, n_expert_used
+        };
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_expert_compact_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected) offset:ds4_gpu_tensor_offset(selected) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(weights)  offset:ds4_gpu_tensor_offset(weights)  atIndex:2];
+        [enc setBuffer:count_buf offset:0 atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n_expert_used, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "expert_compact")) return 0;
+
+        *compacted_count = *(const uint32_t *)count_buf.contents;
     }
     return 1;
 }
